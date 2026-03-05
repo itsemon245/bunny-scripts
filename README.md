@@ -60,6 +60,22 @@ Directory listings are streamed through `ijson` item-by-item so large directorie
 materialise fully in memory. The BFS queue lives in heap memory, so directory trees of
 any depth are handled without hitting Python's recursion limit.
 
+### Path-date fast path
+
+When a directory path contains a `YYYY-MM-DD` segment (e.g. `.../2025-03-14/`), the
+script uses the date directly without waiting for the API's `DateCreated` field:
+
+| Condition | Action | API calls saved |
+|---|---|---|
+| Date fails `--before` / `--since` filter | Skip directory entirely | list + all deletes |
+| Date passes filter + no exceptions under dir | Bulk-delete whole directory in one call | list + N−1 deletes |
+| Date passes filter + exceptions exist under dir | Fall through to normal per-file listing | none |
+| No date in path | Fall through to normal per-file listing | none |
+
+This is most impactful for large date-partitioned storage zones — a directory like
+`images/app/ai/illustrator/2025-03-14/` containing 10,000 files goes from
+10,001 API calls down to 1.
+
 ---
 
 ## Requirements
@@ -182,7 +198,7 @@ correctly — they normalise to the same key before matching.
 | `-d`, `--directory` | *(required)* | Directory path inside the storage zone to target |
 | `-r`, `--recursive` | off | Recurse into all sub-directories |
 | `--since YYYY-MM-DD` | — | Only delete files created **on or after** this date |
-| `--before YYYY-MM-DD` | — | Only delete files created **before** this date |
+| `--before YYYY-MM-DD` | *(required)* | Only delete files created **before** this date |
 | `--workers N` | `20` | Max concurrent DELETE requests (safe max: ~80) |
 | `--progress-every N` | `20` | Refresh the terminal counter every N completed operations |
 
@@ -270,12 +286,13 @@ Deleted: 45231 | Skipped: 312 | Errors: 4 | Elapsed: 2h14m03s
 
 ### Log files
 
-Structured logs are written to a date-stamped folder created at startup:
+Structured logs are written to a fixed directory created at startup:
 
 ```
-deletion-logs-2026-03-05/
-    log-1.log        ← active log (rotates at 100 MB)
-    log-1.log.1      ← most recent rotated backup
+logs/
+  delete-files/
+    log-2026-03-05.log        ← active log (rotates at 100 MB)
+    log-2026-03-05.log.1      ← most recent rotated backup
 ```
 
 Each log line is timestamped:
@@ -291,7 +308,7 @@ Each log line is timestamped:
 Follow the log in real time from another tmux pane:
 
 ```bash
-tail -f deletion-logs-2026-03-05/log-1.log
+tail -f logs/delete-files/log-2026-03-05.log
 ```
 
 ---

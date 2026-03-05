@@ -2,7 +2,7 @@
 .env
 
 # Log output directories
-deletion-logs-*/
+logs/
 
 # Python / uv cache
 __pycache__/
