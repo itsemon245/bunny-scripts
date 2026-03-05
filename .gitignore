@@ -1,0 +1,11 @@
+# Credentials — never commit
+.env
+
+# Log output directories
+deletion-logs-*/
+
+# Python / uv cache
+__pycache__/
+*.pyc
+.venv/
+.python-version
