@@ -140,6 +140,29 @@ def parse_args() -> argparse.Namespace:
         dest="progress_every",
         help="Refresh progress counter every N completed operations (default: 20)",
     )
+    parser.add_argument(
+        "--checkpoint",
+        metavar="FILE",
+        default="delete-files.checkpoint",
+        help="Path to checkpoint file for resume support (default: delete-files.checkpoint)",
+    )
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        dest="no_checkpoint",
+        help="Disable checkpoint file (no resume support)",
+    )
+    parser.add_argument(
+        "--watchdog-timeout",
+        type=int,
+        default=0,
+        metavar="SECS",
+        dest="watchdog_timeout",
+        help=(
+            "Exit cleanly if no progress is made for this many seconds (default: 0). "
+            "Set to 0 to disable."
+        ),
+    )
 
     # Credential overrides — take priority over environment variables
     creds = parser.add_argument_group("credentials (override environment variables)")
@@ -637,6 +660,64 @@ async def cleanup_empty_dirs(
             pass  # listing failed — leave the directory alone
 
 
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+
+def load_checkpoint(path: str) -> set[str]:
+    """
+    Load the set of already-completed directory paths from a checkpoint file.
+    Each line is one directory path (full BFS path including zone prefix).
+    Returns an empty set if the file does not exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        return set()
+    completed: set[str] = set()
+    with p.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                completed.add(line)
+    print(f"  Resuming: loaded {len(completed)} completed directories from {path}\n", flush=True)
+    return completed
+
+
+def append_checkpoint(path: str, dir_path: str) -> None:
+    """Append a single completed directory path to the checkpoint file."""
+    with open(path, "a") as fh:
+        fh.write(dir_path + "\n")
+
+
+# ── Watchdog task ─────────────────────────────────────────────────────────────
+
+async def watchdog_task(
+    counters: dict[str, int],
+    shutdown_event: asyncio.Event,
+    timeout_secs: int,
+    logger: logging.Logger,
+) -> None:
+    """
+    Periodically check whether any progress has been made.
+    If counters['total'] has not changed for timeout_secs seconds, log a warning
+    and trigger a clean shutdown via shutdown_event.
+    """
+    last_total = counters["total"]
+    while not shutdown_event.is_set():
+        await asyncio.sleep(min(timeout_secs, 30))
+        if shutdown_event.is_set():
+            break
+        current_total = counters["total"]
+        if current_total == last_total:
+            msg = (
+                f"[WATCHDOG] No progress in {timeout_secs}s "
+                f"(total={current_total}). Triggering clean exit."
+            )
+            print(f"\n{msg}", flush=True)
+            logger.warning(msg)
+            shutdown_event.set()
+            return
+        last_total = current_total
+
+
 # ── BFS main loop ─────────────────────────────────────────────────────────────
 
 async def run(args: argparse.Namespace) -> None:
@@ -652,22 +733,43 @@ async def run(args: argparse.Namespace) -> None:
     # Used by the post-run empty-directory cleanup pass.
     visited_dirs: set[str] = set()
 
+    checkpoint_path: str | None = None if args.no_checkpoint else args.checkpoint
+    completed_dirs: set[str] = (
+        load_checkpoint(checkpoint_path) if checkpoint_path else set()
+    )
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         loop.add_signal_handler(sig, shutdown_event.set)
+
+    if args.watchdog_timeout > 0:
+        wdog = asyncio.create_task(
+            watchdog_task(counters, shutdown_event, args.watchdog_timeout, logger)
+        )
+    else:
+        wdog = None
 
     # BFS queue holds full paths including zone prefix, e.g. /myzone/images/
     queue: asyncio.Queue[str] = asyncio.Queue()
     await queue.put(f"/{STORAGE_ZONE}/{args.directory}")
 
     connector = aiohttp.TCPConnector(limit=args.workers + 10)
+    timeout = aiohttp.ClientTimeout(connect=30, sock_read=120)
     async with aiohttp.ClientSession(
         connector=connector,
         headers={"AccessKey": API_KEY},
+        timeout=timeout,
     ) as session:
         try:
             while not queue.empty() and not shutdown_event.is_set():
                 dir_path = await queue.get()
+
+                # ── Checkpoint skip ───────────────────────────────────────────
+                if dir_path in completed_dirs:
+                    logger.info(f"[CHECKPOINT] {dir_path} (already completed, skipping)")
+                    continue
+                # ─────────────────────────────────────────────────────────────
+
                 dk = _dir_key(dir_path, STORAGE_ZONE)
 
                 # ── Path-date fast path ───────────────────────────────────────
@@ -745,6 +847,11 @@ async def run(args: argparse.Namespace) -> None:
                         tasks.add(task)
                         task.add_done_callback(tasks.discard)
 
+                    # Listing completed without error — mark directory as done.
+                    if not shutdown_event.is_set() and checkpoint_path:
+                        completed_dirs.add(dir_path)
+                        append_checkpoint(checkpoint_path, dir_path)
+
                     if not had_items and not shutdown_event.is_set():
                         # Directory was already empty — delete it immediately.
                         task = asyncio.create_task(
@@ -776,7 +883,15 @@ async def run(args: argparse.Namespace) -> None:
                 )
 
         finally:
+            if wdog is not None:
+                wdog.cancel()
             _print_summary(counters, start, logger)
+            if checkpoint_path and shutdown_event.is_set():
+                print(
+                    f"  Checkpoint saved to '{checkpoint_path}'. "
+                    "Re-run with the same command to resume.",
+                    flush=True,
+                )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
