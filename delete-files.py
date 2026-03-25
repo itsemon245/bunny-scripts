@@ -28,8 +28,10 @@ import ijson
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_ATTEMPTS = 6
+MAX_ATTEMPTS = 4
 BASE_DELAY = 1.0
+MAX_BACKOFF = 16          # cap exponential backoff at 16 seconds
+REQUEST_TIMEOUT = 60      # per-attempt total timeout for non-streaming requests
 
 # Matches YYYY-MM-DD date segments inside storage paths
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -155,12 +157,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--watchdog-timeout",
         type=int,
-        default=0,
+        default=None,
         metavar="SECS",
         dest="watchdog_timeout",
         help=(
-            "Exit cleanly if no progress is made for this many seconds (default: 0). "
-            "Set to 0 to disable."
+            "Exit cleanly if no progress is made for this many seconds. "
+            "Disabled by default; only active when explicitly set."
         ),
     )
 
@@ -295,12 +297,6 @@ def load_exceptions() -> ExceptionSets:
     return exact, dirs
 
 
-def _is_exception(file_key: str, exact: set[str], dirs: set[str]) -> bool:
-    """Return True if file_key is an exact exception or falls under an excepted directory."""
-    if file_key in exact:
-        return True
-    return any(file_key.startswith(d) for d in dirs)
-
 
 def _exception_reason(file_key: str, exact: set[str], dirs: set[str]) -> str | None:
     """Return a human-readable skip reason if file_key is an exception, else None."""
@@ -431,33 +427,55 @@ def _any_exception_under(dir_key: str, exc_exact: set[str], exc_dirs: set[str]) 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
+class _Exhausted:
+    """Sentinel returned by _request_with_retry when all attempts fail."""
+    __slots__ = ("reason", "timed_out")
+    def __init__(self, reason: str, timed_out: bool) -> None:
+        self.reason = reason
+        self.timed_out = timed_out
+
+
 async def _request_with_retry(
     session: aiohttp.ClientSession,
     method: str,
     url: str,
     **kwargs,
-) -> aiohttp.ClientResponse | None:
+) -> aiohttp.ClientResponse | _Exhausted:
     """
     Non-streaming request with exponential back-off on 429/5xx.
-    The caller is responsible for releasing the returned response.
+    Each attempt is bounded by REQUEST_TIMEOUT seconds.
+    Returns a response on success, or an _Exhausted sentinel on failure
+    (with timed_out=True when every failed attempt was a timeout).
+    The caller is responsible for releasing any returned response.
     """
+    per_req = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
     last_exc: Exception | None = None
+    timeout_count = 0
     for attempt in range(MAX_ATTEMPTS):
         try:
-            resp = await session.request(method, url, **kwargs)
+            resp = await session.request(method, url, timeout=per_req, **kwargs)
             if resp.status == 429:
                 await resp.release()
-                await asyncio.sleep(BASE_DELAY * (2 ** attempt) + random.random())
+                delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+                await asyncio.sleep(delay)
                 continue
             if resp.status >= 500:
                 await resp.release()
-                await asyncio.sleep(BASE_DELAY + random.random())
+                delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+                await asyncio.sleep(delay)
                 continue
             return resp
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            timeout_count += 1
+            delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+            await asyncio.sleep(delay)
         except aiohttp.ClientError as exc:
             last_exc = exc
-            await asyncio.sleep(BASE_DELAY * (2 ** attempt) + random.random())
-    return None
+            delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+            await asyncio.sleep(delay)
+    reason = f"after {MAX_ATTEMPTS} attempts" + (f": {last_exc}" if last_exc else "")
+    return _Exhausted(reason=reason, timed_out=(timeout_count == MAX_ATTEMPTS))
 
 
 async def list_files(
@@ -478,10 +496,12 @@ async def list_files(
         try:
             async with session.get(url) as resp:
                 if resp.status == 429:
-                    await asyncio.sleep(BASE_DELAY * (2 ** attempt) + random.random())
+                    delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+                    await asyncio.sleep(delay)
                     continue
                 if resp.status >= 500:
-                    await asyncio.sleep(BASE_DELAY + random.random())
+                    delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+                    await asyncio.sleep(delay)
                     continue
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status} for GET {url}")
@@ -499,7 +519,8 @@ async def list_files(
                 ) from exc
             last_exc = exc
             if attempt < MAX_ATTEMPTS - 1:
-                await asyncio.sleep(BASE_DELAY * (2 ** attempt) + random.random())
+                delay = min(BASE_DELAY * (2 ** attempt), MAX_BACKOFF) + random.random()
+                await asyncio.sleep(delay)
 
     raise RuntimeError(
         f"Failed to list {dir_path} after {MAX_ATTEMPTS} attempts"
@@ -507,28 +528,38 @@ async def list_files(
     )
 
 
+class _DeleteResult:
+    """Outcome of a single file delete attempt."""
+    __slots__ = ("ok", "detail", "timed_out")
+    def __init__(self, ok: bool, detail: str = "", timed_out: bool = False) -> None:
+        self.ok = ok
+        self.detail = detail
+        self.timed_out = timed_out
+
+
 async def delete_file(
     session: aiohttp.ClientSession,
     item_path: str,
     item_name: str,
     base: str,
-) -> tuple[bool, str]:
+) -> _DeleteResult:
     """
     DELETE a single file.
-    Returns (True, "") on success, or (False, reason) on permanent failure.
+    Returns a _DeleteResult with ok=True on success.
+    On failure, detail explains why and timed_out indicates if all attempts timed out.
     """
     encoded_name = urllib.parse.quote(item_name, safe="")
     url = f"{base}{item_path}{encoded_name}"
     resp = await _request_with_retry(session, "DELETE", url)
-    if resp is None:
-        return False, "no response after retries"
+    if isinstance(resp, _Exhausted):
+        return _DeleteResult(ok=False, detail=resp.reason, timed_out=resp.timed_out)
     if resp.status == 200:
         await resp.release()
-        return True, ""
+        return _DeleteResult(ok=True)
     body = (await resp.text())[:300].strip()
     detail = f"HTTP {resp.status}" + (f": {body}" if body else "")
     await resp.release()
-    return False, detail
+    return _DeleteResult(ok=False, detail=detail)
 
 
 # ── Delete worker ─────────────────────────────────────────────────────────────
@@ -543,17 +574,23 @@ async def delete_worker(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
-) -> None:
+) -> bool:
+    """Returns True if the file was deleted successfully."""
     display = item_path + item_name
+    ok = False
     try:
         async with sem:
-            success, detail = await delete_file(session, item_path, item_name, base)
-        if success:
+            result = await delete_file(session, item_path, item_name, base)
+        if result.ok:
             counters["deleted"] += 1
             logger.info(f"[DELETED]  {display}")
+            ok = True
+        elif result.timed_out:
+            counters["skipped"] += 1
+            logger.warning(f"[SKIPPED]  {display} (timed out: {result.detail})")
         else:
             counters["errors"] += 1
-            logger.error(f"[ERROR]    {display} ({detail})")
+            logger.error(f"[ERROR]    {display} ({result.detail})")
     except Exception as exc:
         counters["errors"] += 1
         logger.error(f"[ERROR]    {display}: {exc}")
@@ -566,6 +603,7 @@ async def delete_worker(
             f"[SUMMARY]  Deleted: {d} | Skipped: {s} | "
             f"Errors: {e} | Elapsed: {_elapsed(start)}"
         )
+    return ok
 
 
 # ── Directory bulk-delete worker ─────────────────────────────────────────────
@@ -579,28 +617,36 @@ async def delete_directory_worker(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
-) -> None:
-    """Delete an entire directory with a single API call (Bunny deletes recursively)."""
+) -> bool:
+    """Delete an entire directory with a single API call (Bunny deletes recursively).
+    Returns True if the directory was deleted (or was already empty)."""
     url = f"{base}{dir_path}"
+    ok = False
     try:
         async with sem:
             resp = await _request_with_retry(session, "DELETE", url)
-        if resp is not None and resp.status == 200:
+        if isinstance(resp, _Exhausted):
+            if resp.timed_out:
+                counters["skipped"] += 1
+                logger.warning(f"[SKIPPED DIR] {dir_path} (timed out: {resp.reason})")
+            else:
+                counters["errors"] += 1
+                logger.error(f"[ERROR DIR]   {dir_path} ({resp.reason})")
+        elif resp.status == 200:
             await resp.release()
             counters["deleted"] += 1
             logger.info(f"[DELETED DIR] {dir_path}")
-        elif resp is not None and resp.status == 404:
+            ok = True
+        elif resp.status == 404:
             # Bunny returns 404 when the directory has no contents to delete.
             # This is a success — the directory is empty or already gone.
             await resp.release()
             logger.info(f"[EMPTY DIR]   {dir_path}")
+            ok = True
         else:
-            if resp is not None:
-                body = (await resp.text())[:300].strip()
-                detail = f"HTTP {resp.status}" + (f": {body}" if body else "")
-                await resp.release()
-            else:
-                detail = "no response after retries"
+            body = (await resp.text())[:300].strip()
+            detail = f"HTTP {resp.status}" + (f": {body}" if body else "")
+            await resp.release()
             counters["errors"] += 1
             logger.error(f"[ERROR DIR]   {dir_path} ({detail})")
     except Exception as exc:
@@ -615,6 +661,7 @@ async def delete_directory_worker(
             f"[SUMMARY]  Deleted: {d} | Skipped: {s} | "
             f"Errors: {e} | Elapsed: {_elapsed(start)}"
         )
+    return ok
 
 
 # ── Empty-directory helpers ───────────────────────────────────────────────────
@@ -639,6 +686,7 @@ async def cleanup_empty_dirs(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
+    shutdown_event: asyncio.Event | None = None,
 ) -> None:
     """
     Second pass: delete any visited directories that are now empty.
@@ -650,6 +698,8 @@ async def cleanup_empty_dirs(
 
     sorted_dirs = sorted(visited_dirs, key=lambda p: p.count("/"), reverse=True)
     for dir_path in sorted_dirs:
+        if shutdown_event is not None and shutdown_event.is_set():
+            break
         try:
             if await _is_empty_dir(session, dir_path, base):
                 await delete_directory_worker(
@@ -681,10 +731,141 @@ def load_checkpoint(path: str) -> set[str]:
     return completed
 
 
-def append_checkpoint(path: str, dir_path: str) -> None:
-    """Append a single completed directory path to the checkpoint file."""
-    with open(path, "a") as fh:
-        fh.write(dir_path + "\n")
+
+def _check_dir_own_status(
+    dir_path: str,
+    completed_dirs: set[str],
+    dir_listing_ok: set[str],
+    dir_date_skipped: set[str],
+    dir_listing_failed: set[str],
+    dir_task_failed: set[str],
+    dirs_with_tasks: set[str],
+) -> bool | None:
+    """
+    Check only this directory's own status (ignoring children).
+    Returns True if own work succeeded, False if failed, None if unknown.
+    """
+    if dir_path in completed_dirs:
+        return True
+    if dir_path in dir_date_skipped:
+        return True
+    if dir_path in dir_listing_failed:
+        return False
+    if dir_path in dir_task_failed:
+        return False
+    # Must have been listed or had tasks (fast-path bulk delete)
+    if dir_path not in dir_listing_ok and dir_path not in dirs_with_tasks:
+        return False
+    return True
+
+
+def _compute_completed_dirs(
+    completed_dirs: set[str],
+    dir_listing_ok: set[str],
+    dir_date_skipped: set[str],
+    dir_listing_failed: set[str],
+    dir_task_failed: set[str],
+    dirs_with_tasks: set[str],
+    dir_children: dict[str, set[str]],
+) -> set[str]:
+    """
+    Iterative bottom-up computation of which directories are fully complete.
+    A directory is complete when its own work succeeded AND all children
+    are complete.  Returns the set of newly completed directory paths.
+    Uses iterative post-order DFS to avoid recursion-depth limits.
+    """
+    cache: dict[str, bool] = {}
+
+    # All directories we touched this run.
+    all_dirs = dir_listing_ok | dir_date_skipped | dirs_with_tasks
+
+    for root in all_dirs:
+        if root in cache or root in completed_dirs:
+            continue
+
+        # Iterative post-order DFS
+        stack: list[tuple[str, bool]] = [(root, False)]
+        while stack:
+            node, children_done = stack[-1]
+
+            if node in cache:
+                stack.pop()
+                continue
+
+            # Quick exit for known states
+            own = _check_dir_own_status(
+                node, completed_dirs, dir_listing_ok, dir_date_skipped,
+                dir_listing_failed, dir_task_failed, dirs_with_tasks,
+            )
+            if own is True and node in completed_dirs:
+                cache[node] = True
+                stack.pop()
+                continue
+            if own is False:
+                cache[node] = False
+                stack.pop()
+                continue
+
+            children = dir_children.get(node, set())
+
+            if not children_done:
+                # First visit — push children that aren't resolved yet
+                unresolved = [c for c in children if c not in cache and c not in completed_dirs]
+                if unresolved:
+                    stack[-1] = (node, True)  # mark children as being processed
+                    for c in unresolved:
+                        stack.append((c, False))
+                    continue
+                # No unresolved children — fall through
+
+            # All children resolved — compute this node's result
+            all_ok = own is True and all(
+                cache.get(c, c in completed_dirs) for c in children
+            )
+            cache[node] = all_ok
+            stack.pop()
+
+    return {d for d, ok in cache.items() if ok and d not in completed_dirs}
+
+
+def _save_checkpoint(
+    checkpoint_path: str,
+    completed_dirs: set[str],
+    dir_listing_ok: set[str],
+    dir_date_skipped: set[str],
+    dir_listing_failed: set[str],
+    dir_task_failed: set[str],
+    dirs_with_tasks: set[str],
+    dir_children: dict[str, set[str]],
+    logger: logging.Logger,
+) -> None:
+    """
+    Compute which directories are fully complete (bottom-up) and write
+    the checkpoint file.  Only directories whose own tasks AND entire
+    subtree succeeded are recorded.
+    """
+    newly_completed = _compute_completed_dirs(
+        completed_dirs, dir_listing_ok, dir_date_skipped,
+        dir_listing_failed, dir_task_failed, dirs_with_tasks,
+        dir_children,
+    )
+
+    if newly_completed:
+        flush_every = 1000
+        written = 0
+        with open(checkpoint_path, "a") as fh:
+            for d in sorted(newly_completed):
+                fh.write(d + "\n")
+                written += 1
+                if written % flush_every == 0:
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            fh.flush()
+            os.fsync(fh.fileno())
+        logger.info(
+            f"[CHECKPOINT] {len(newly_completed)} new directories marked complete "
+            f"(total: {len(completed_dirs) + len(newly_completed)})"
+        )
 
 
 # ── Watchdog task ─────────────────────────────────────────────────────────────
@@ -727,7 +908,6 @@ async def run(args: argparse.Namespace) -> None:
     start = datetime.datetime.now()
     counters: dict[str, int] = {"deleted": 0, "skipped": 0, "errors": 0, "total": 0}
     sem = asyncio.Semaphore(args.workers)
-    tasks: set[asyncio.Task] = set()
     shutdown_event = asyncio.Event()
     # Directories processed via normal listing (not fast-path bulk delete).
     # Used by the post-run empty-directory cleanup pass.
@@ -738,11 +918,50 @@ async def run(args: argparse.Namespace) -> None:
         load_checkpoint(checkpoint_path) if checkpoint_path else set()
     )
 
+    # ── Per-directory state for bottom-up checkpointing ──────────────────
+    dir_children: dict[str, set[str]] = {}   # parent → child dirs
+    dirs_with_tasks: set[str] = set()        # dirs that had any tasks created
+    dir_task_failed: set[str] = set()        # dirs where at least one task failed
+    dir_listing_ok: set[str] = set()         # dirs whose listing completed ok
+    dir_date_skipped: set[str] = set()       # dirs skipped by date fast-path
+    dir_listing_failed: set[str] = set()     # dirs whose listing errored
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Memory-efficient task tracking ───────────────────────────────────
+    # Only pending (not yet completed) tasks are held in this set.
+    # Completed tasks are discarded via callback, allowing GC.
+    pending_tasks: set[asyncio.Task] = set()
+    max_pending = args.workers * 10   # backpressure threshold
+
+    def _on_task_done(dir_path: str, t: asyncio.Task) -> None:
+        pending_tasks.discard(t)
+        try:
+            if t.result() is not True:
+                dir_task_failed.add(dir_path)
+        except BaseException:
+            dir_task_failed.add(dir_path)
+
+    def _spawn_task(coro, dir_path: str) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        pending_tasks.add(task)
+        dirs_with_tasks.add(dir_path)
+        task.add_done_callback(lambda t: _on_task_done(dir_path, t))
+        return task
+
+    async def _drain_if_needed() -> None:
+        """Apply backpressure: if too many tasks are pending, wait for some."""
+        while len(pending_tasks) >= max_pending:
+            done, _ = await asyncio.wait(
+                pending_tasks, return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Callbacks already fired for done tasks
+    # ─────────────────────────────────────────────────────────────────────
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         loop.add_signal_handler(sig, shutdown_event.set)
 
-    if args.watchdog_timeout > 0:
+    if args.watchdog_timeout is not None and args.watchdog_timeout > 0:
         wdog = asyncio.create_task(
             watchdog_task(counters, shutdown_event, args.watchdog_timeout, logger)
         )
@@ -751,7 +970,8 @@ async def run(args: argparse.Namespace) -> None:
 
     # BFS queue holds full paths including zone prefix, e.g. /myzone/images/
     queue: asyncio.Queue[str] = asyncio.Queue()
-    await queue.put(f"/{STORAGE_ZONE}/{args.directory}")
+    root_dir = f"/{STORAGE_ZONE}/{args.directory}"
+    await queue.put(root_dir)
 
     connector = aiohttp.TCPConnector(limit=args.workers + 10)
     timeout = aiohttp.ClientTimeout(connect=30, sock_read=120)
@@ -764,10 +984,8 @@ async def run(args: argparse.Namespace) -> None:
             while not queue.empty() and not shutdown_event.is_set():
                 dir_path = await queue.get()
 
-                # ── Checkpoint skip ───────────────────────────────────────────
-                if dir_path in completed_dirs:
-                    logger.info(f"[CHECKPOINT] {dir_path} (already completed, skipping)")
-                    continue
+                # ── Already completed in a previous run? ─────────────────────
+                is_checkpointed = dir_path in completed_dirs
                 # ─────────────────────────────────────────────────────────────
 
                 dk = _dir_key(dir_path, STORAGE_ZONE)
@@ -775,8 +993,9 @@ async def run(args: argparse.Namespace) -> None:
                 # ── Path-date fast path ───────────────────────────────────────
                 # If the directory path contains a date segment, we can decide
                 # whether to skip or bulk-delete without listing at all.
+                # Skip fast-path for checkpointed dirs — they were already handled.
                 path_date = _extract_path_date(dk)
-                if path_date is not None:
+                if path_date is not None and not is_checkpointed:
                     if not _passes_date_filter(
                         {"DateCreated": str(path_date)}, args.since_date, args.before_date
                     ):
@@ -786,23 +1005,25 @@ async def run(args: argparse.Namespace) -> None:
                         else:
                             dir_skip_reason = f"date filter: dir date {path_date}, too recent (--before cutoff is {args.before_date})"
                         logger.info(f"[SKIPPED DIR] {dk} ({dir_skip_reason})")
+                        dir_date_skipped.add(dir_path)
                         continue
 
                     if not _any_exception_under(dk, exc_exact, exc_dirs):
                         # Date passes and no exceptions inside — bulk delete.
-                        task = asyncio.create_task(
+                        await _drain_if_needed()
+                        _spawn_task(
                             delete_directory_worker(
                                 session, sem, dir_path, base,
                                 counters, logger, start, args.progress_every,
-                            )
+                            ),
+                            dir_path,
                         )
-                        tasks.add(task)
-                        task.add_done_callback(tasks.discard)
                         continue
                     # else: date passes but exceptions exist — fall through to listing
                 # ─────────────────────────────────────────────────────────────
 
-                visited_dirs.add(dir_path)
+                if not is_checkpointed:
+                    visited_dirs.add(dir_path)
                 had_items = False
                 try:
                     async for item in list_files(session, dir_path, base):
@@ -814,7 +1035,13 @@ async def run(args: argparse.Namespace) -> None:
                         if item["IsDirectory"]:
                             if args.recursive:
                                 subdir = item["Path"] + item["ObjectName"] + "/"
+                                dir_children.setdefault(dir_path, set()).add(subdir)
                                 await queue.put(subdir)
+                            continue
+
+                        # Checkpointed directories only need subdirectory
+                        # discovery — file-level work was already done.
+                        if is_checkpointed:
                             continue
 
                         file_key = _file_key(item, STORAGE_ZONE)
@@ -837,59 +1064,78 @@ async def run(args: argparse.Namespace) -> None:
                                 _print_progress(counters, start)
                             continue
 
-                        task = asyncio.create_task(
+                        await _drain_if_needed()
+                        _spawn_task(
                             delete_worker(
                                 session, sem,
                                 item["Path"], item["ObjectName"],
                                 base, counters, logger, start, args.progress_every,
-                            )
+                            ),
+                            dir_path,
                         )
-                        tasks.add(task)
-                        task.add_done_callback(tasks.discard)
 
-                    # Listing completed without error — mark directory as done.
-                    if not shutdown_event.is_set() and checkpoint_path:
-                        completed_dirs.add(dir_path)
-                        append_checkpoint(checkpoint_path, dir_path)
+                    if not shutdown_event.is_set():
+                        dir_listing_ok.add(dir_path)
 
-                    if not had_items and not shutdown_event.is_set():
+                    if not had_items and not shutdown_event.is_set() and not is_checkpointed:
                         # Directory was already empty — delete it immediately.
-                        task = asyncio.create_task(
+                        await _drain_if_needed()
+                        _spawn_task(
                             delete_directory_worker(
                                 session, sem, dir_path, base,
                                 counters, logger, start, args.progress_every,
-                            )
+                            ),
+                            dir_path,
                         )
-                        tasks.add(task)
-                        task.add_done_callback(tasks.discard)
                         visited_dirs.discard(dir_path)  # no need to re-check later
 
                 except RuntimeError as exc:
                     logger.error(f"[ERROR]    Failed to list {dir_path}: {exc}")
                     counters["errors"] += 1
                     counters["total"] += 1
+                    dir_listing_failed.add(dir_path)
 
             if shutdown_event.is_set():
                 print("\n[INTERRUPTED] Waiting for in-flight deletes to finish...")
 
-            if tasks:
-                await asyncio.gather(*list(tasks), return_exceptions=True)
+            # Wait for remaining pending tasks to complete.
+            if pending_tasks:
+                await asyncio.gather(*list(pending_tasks), return_exceptions=True)
 
             # Post-run cleanup: delete directories that became empty after file deletion.
             if not shutdown_event.is_set():
                 await cleanup_empty_dirs(
                     session, sem, visited_dirs, base,
                     counters, logger, start, args.progress_every,
+                    shutdown_event,
                 )
+
+            # ── Bottom-up checkpointing ──────────────────────────────────
+            # A directory is "fully complete" only when:
+            #   1. Its listing succeeded (or it was date-skipped / already checkpointed)
+            #   2. All of its own file/bulk-delete tasks succeeded
+            #   3. All of its child directories are fully complete (recursive)
+            if checkpoint_path:
+                _save_checkpoint(
+                    checkpoint_path, completed_dirs,
+                    dir_listing_ok, dir_date_skipped, dir_listing_failed,
+                    dir_task_failed, dirs_with_tasks,
+                    dir_children, logger,
+                )
+            # ─────────────────────────────────────────────────────────────
 
         finally:
             if wdog is not None:
                 wdog.cancel()
             _print_summary(counters, start, logger)
-            if checkpoint_path and shutdown_event.is_set():
+            if checkpoint_path:
+                total_completed = sum(
+                    1 for line in Path(checkpoint_path).open()
+                    if line.strip()
+                ) if Path(checkpoint_path).exists() else 0
                 print(
-                    f"  Checkpoint saved to '{checkpoint_path}'. "
-                    "Re-run with the same command to resume.",
+                    f"  Checkpoint: {total_completed} completed directories "
+                    f"saved to '{checkpoint_path}'.",
                     flush=True,
                 )
 
