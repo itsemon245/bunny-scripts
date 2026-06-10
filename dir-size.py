@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -113,6 +116,44 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Retries per listing on 429/5xx/transport errors (default: 4).",
     )
+    parser.add_argument(
+        "--report",
+        default="dir-size-report.tsv",
+        metavar="PATH",
+        help="Write per-directory TSV report to PATH "
+             "(default: dir-size-report.tsv). Pass empty string to disable.",
+    )
+    parser.add_argument(
+        "--zip-csv",
+        default="zips.csv",
+        metavar="PATH",
+        help="Write inventory of .zip files (url,size,created_at) to PATH "
+             "(default: zips.csv). Pass empty string to disable.",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=500,
+        metavar="N",
+        help="Flush the in-memory report/zip buffers to disk whenever "
+             "either buffer reaches N rows (default: 500). Keeps peak "
+             "memory bounded on huge zones.",
+    )
+    parser.add_argument(
+        "--no-sort",
+        action="store_true",
+        help="Skip post-run sorting of output files. "
+             "By default the TSV is sorted by subtree_bytes desc and the "
+             "zip CSV by size desc.",
+    )
+    parser.add_argument(
+        "--no-human-cols",
+        action="store_true",
+        help="Omit the human-readable size columns "
+             "(subtree_size_h, own_size_h in the TSV; size_h in the zip "
+             "CSV). Reduces file size by ~10-15%% at the cost of "
+             "readability when eyeballing.",
+    )
 
     creds = parser.add_argument_group("credentials (override environment variables)")
     creds.add_argument("--storage-zone", default=None, metavar="NAME")
@@ -204,9 +245,25 @@ async def walk_dir(
     totals: dict[str, int],
     console: Console,
     max_retries: int,
-) -> None:
-    """Recursively walk dir_path and accumulate file count and total bytes."""
+    depth: int,
+    records: list,
+    zips: list,
+    report_writer,
+    zip_writer,
+    flush_every: int,
+    human_cols: bool,
+) -> tuple[int, int]:
+    """Recursively walk dir_path; return (subtree_bytes, subtree_files).
+
+    Per-directory rows are appended to the shared `records` list and zip
+    rows to the shared `zips` list. Whenever either list reaches
+    `flush_every`, it is written out and cleared so peak memory stays
+    bounded regardless of zone size. Leftovers are flushed by the caller
+    in run()'s finally block, so an interrupt loses nothing on disk.
+    """
     subdirs: list[str] = []
+    own_bytes = 0
+    own_files = 0
     async with sem:
         try:
             async for item in list_dir(session, dir_path, base, max_retries):
@@ -214,19 +271,106 @@ async def walk_dir(
                     if recursive:
                         subdirs.append(item["Path"] + item["ObjectName"] + "/")
                     continue
+                size = int(item.get("Length") or 0)
+                own_bytes += size
+                own_files += 1
                 totals["files"] += 1
-                totals["bytes"] += int(item.get("Length") or 0)
+                totals["bytes"] += size
+                name = item.get("ObjectName") or ""
+                if zip_writer is not None and len(name) >= 4 and name[-4:].lower() == ".zip":
+                    zip_row = [
+                        (item.get("Path") or "") + name,
+                        size,
+                    ]
+                    if human_cols:
+                        zip_row.append(_human(size))
+                    zip_row.append(item.get("DateCreated") or "")
+                    zips.append(tuple(zip_row))
+                    if len(zips) >= flush_every:
+                        zip_writer.writerows(zips)
+                        zips.clear()
             totals["dirs"] += 1
         except RuntimeError as exc:
             console.print(f"[yellow]WARNING:[/] {exc}")
             totals["errors"] += 1
-            return
+            return (0, 0)
 
+    subtree_bytes = own_bytes
+    subtree_files = own_files
     if subdirs:
-        await asyncio.gather(*(
-            walk_dir(session, sd, base, recursive, sem, totals, console, max_retries)
+        results = await asyncio.gather(*(
+            walk_dir(session, sd, base, recursive, sem, totals, console,
+                     max_retries, depth + 1, records, zips,
+                     report_writer, zip_writer, flush_every, human_cols)
             for sd in subdirs
         ))
+        for sb, sf in results:
+            subtree_bytes += sb
+            subtree_files += sf
+
+    if report_writer is not None:
+        if human_cols:
+            records.append((
+                dir_path,
+                subtree_bytes, _human(subtree_bytes), subtree_files,
+                own_bytes, _human(own_bytes), own_files,
+                depth,
+            ))
+        else:
+            records.append((
+                dir_path, subtree_bytes, subtree_files,
+                own_bytes, own_files, depth,
+            ))
+        if len(records) >= flush_every:
+            report_writer.writerows(records)
+            records.clear()
+
+    return (subtree_bytes, subtree_files)
+
+
+# ── Post-run sorting ──────────────────────────────────────────────────────────
+
+def _sort_tsv_by_col_desc(path: str, col: int) -> None:
+    """Sort a TSV file in place by `col` (1-indexed) as a number, descending.
+
+    Uses GNU sort so we don't have to hold the file in memory — important on
+    huge zones. Preserves the header row.
+    """
+    qpath = shlex.quote(path)
+    qtmp = shlex.quote(path + ".sorted.tmp")
+    cmd = (
+        "set -euo pipefail; "
+        f"head -n 1 {qpath} > {qtmp}; "
+        f"tail -n +2 {qpath} | LC_ALL=C sort -t$'\\t' "
+        f"-k{col},{col}nr -S 200M >> {qtmp}; "
+        f"mv {qtmp} {qpath}"
+    )
+    subprocess.run(["bash", "-c", cmd], check=True)
+
+
+def _sort_csv_by_col_desc(path: str, col: int) -> None:
+    """Sort a CSV file in place by `col` (0-indexed) as a number, descending.
+
+    Uses Python's csv module so quoted fields (e.g. URLs containing commas)
+    are handled correctly. Loads the file into memory — fine for the zip
+    list, which is normally much smaller than the directory report.
+    """
+    with open(path, newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        rows = list(reader)
+
+    def _key(row):
+        try:
+            return int(row[col])
+        except (IndexError, ValueError):
+            return -1
+
+    rows.sort(key=_key, reverse=True)
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -258,10 +402,43 @@ async def run(args: argparse.Namespace) -> None:
     base = get_base_url()
     root = f"/{STORAGE_ZONE}/{args.directory}"
     totals: dict[str, int] = {"files": 0, "bytes": 0, "errors": 0, "dirs": 0}
+    records: list[tuple] = []
+    zips: list[tuple] = []
     sem = asyncio.Semaphore(args.workers)
 
     console = Console()
     interrupted = False
+
+    human_cols = not args.no_human_cols
+
+    # Open output files up-front so the walker can stream-flush into them.
+    report_fh = None
+    report_writer = None
+    if args.report:
+        report_fh = open(args.report, "w", newline="")
+        report_writer = csv.writer(report_fh, delimiter="\t")
+        if human_cols:
+            report_writer.writerow([
+                "path",
+                "subtree_bytes", "subtree_size_h", "subtree_files",
+                "own_bytes", "own_size_h", "own_files",
+                "depth",
+            ])
+        else:
+            report_writer.writerow([
+                "path", "subtree_bytes", "subtree_files",
+                "own_bytes", "own_files", "depth",
+            ])
+
+    zip_fh = None
+    zip_writer = None
+    if args.zip_csv:
+        zip_fh = open(args.zip_csv, "w", newline="")
+        zip_writer = csv.writer(zip_fh)
+        if human_cols:
+            zip_writer.writerow(["url", "size", "size_h", "created_at"])
+        else:
+            zip_writer.writerow(["url", "size", "created_at"])
 
     connector = aiohttp.TCPConnector(limit=args.workers + 5)
     timeout = aiohttp.ClientTimeout(connect=30, sock_read=120)
@@ -280,47 +457,89 @@ async def run(args: argparse.Namespace) -> None:
         transient=False,
     )
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        headers={"AccessKey": API_KEY},
-        timeout=timeout,
-    ) as session:
-        console.print(f"[bold cyan]Scanning[/] {root} ...")
-        with progress:
-            task_id = progress.add_task(
-                "Walking", total=None, dirs=0, files=0, size="0 B"
-            )
-            refresher = asyncio.create_task(
-                _refresh_progress(progress, task_id, totals)
-            )
-            walker = asyncio.create_task(
-                walk_dir(
-                    session,
-                    root,
-                    base,
-                    not args.no_recursive,
-                    sem,
-                    totals,
-                    console,
-                    args.retries,
+    try:
+        async with aiohttp.ClientSession(
+            connector=connector,
+            headers={"AccessKey": API_KEY},
+            timeout=timeout,
+        ) as session:
+            console.print(f"[bold cyan]Scanning[/] {root} ...")
+            with progress:
+                task_id = progress.add_task(
+                    "Walking", total=None, dirs=0, files=0, size="0 B"
                 )
-            )
-            try:
-                await walker
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                interrupted = True
-                walker.cancel()
-                # Wait for the walker (and any subtasks gather created) to finish unwinding.
+                refresher = asyncio.create_task(
+                    _refresh_progress(progress, task_id, totals)
+                )
+                walker = asyncio.create_task(
+                    walk_dir(
+                        session,
+                        root,
+                        base,
+                        not args.no_recursive,
+                        sem,
+                        totals,
+                        console,
+                        args.retries,
+                        0,
+                        records,
+                        zips,
+                        report_writer,
+                        zip_writer,
+                        args.flush_every,
+                        human_cols,
+                    )
+                )
                 try:
                     await walker
-                except (asyncio.CancelledError, Exception):
-                    pass
-            finally:
-                refresher.cancel()
-                try:
-                    await refresher
-                except asyncio.CancelledError:
-                    pass
+                except (asyncio.CancelledError, KeyboardInterrupt):
+                    interrupted = True
+                    walker.cancel()
+                    # Wait for the walker (and any subtasks gather created) to finish unwinding.
+                    try:
+                        await walker
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                finally:
+                    refresher.cancel()
+                    try:
+                        await refresher
+                    except asyncio.CancelledError:
+                        pass
+    finally:
+        # Flush whatever is still buffered (covers normal exit, errors, and
+        # Ctrl+C), then close the files so the OS buffer is committed.
+        if report_writer is not None and records:
+            report_writer.writerows(records)
+            records.clear()
+        if zip_writer is not None and zips:
+            zip_writer.writerows(zips)
+            zips.clear()
+        if report_fh is not None:
+            report_fh.close()
+            console.print(f"[green]Report:[/] {args.report}")
+        if zip_fh is not None:
+            zip_fh.close()
+            console.print(f"[green]Zip CSV:[/] {args.zip_csv}")
+
+    # Post-run sort (skip on interrupt — partial files should stay as-is).
+    if not args.no_sort and not interrupted:
+        if args.report:
+            try:
+                _sort_tsv_by_col_desc(args.report, col=2)
+                console.print(
+                    f"[green]Sorted report:[/] {args.report} by subtree_bytes desc"
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                console.print(f"[red]Failed to sort report:[/] {exc}")
+        if args.zip_csv:
+            try:
+                _sort_csv_by_col_desc(args.zip_csv, col=1)
+                console.print(
+                    f"[green]Sorted zip CSV:[/] {args.zip_csv} by size desc"
+                )
+            except OSError as exc:
+                console.print(f"[red]Failed to sort zip CSV:[/] {exc}")
 
     mode = "recursive" if not args.no_recursive else "top-level only"
     console.print()
