@@ -1,0 +1,9 @@
+# Match any Bunny storage path that enters a directory segment named kdp-images.
+(^|/)kdp-images(/|$)
+
+# Match paths that enter ai-bulk-actions steps directories.
+# Supports:
+#   ai-bulk-actions/steps/
+#   ai-bulk-actions/YYYY-MM-DD/steps/
+#   ai-bulk-actions/YYYY/MM/DD/steps/
+(^|/)ai-bulk-actions/(?:\d{4}-\d{2}-\d{2}/|\d{4}/\d{2}/\d{2}/)?steps(/|$)

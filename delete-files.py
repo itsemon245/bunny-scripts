@@ -4,6 +4,7 @@
 # dependencies = [
 #   "aiohttp>=3.9",
 #   "ijson>=3.2",
+#   "rich>=13.7",
 # ]
 # ///
 
@@ -25,6 +26,8 @@ import re
 
 import aiohttp
 import ijson
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +35,7 @@ MAX_ATTEMPTS = 4
 BASE_DELAY = 1.0
 MAX_BACKOFF = 16          # cap exponential backoff at 16 seconds
 REQUEST_TIMEOUT = 60      # per-attempt total timeout for non-streaming requests
+MIN_SAFE_AGE_DAYS = 365
 
 # Matches YYYY-MM-DD date segments inside storage paths
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
@@ -103,6 +107,7 @@ def parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  ./delete-files.py -d images/ -r --before 2024-01-01\n"
             "  ./delete-files.py -d images/ -r --since 2023-01-01 --before 2024-01-01\n"
+            "  ./delete-files.py -d / -r --before 2025-01-01 --match-list match.list\n"
         ),
     )
     parser.add_argument(
@@ -128,6 +133,19 @@ def parse_args() -> argparse.Namespace:
         help="Only delete files created before this date (required)",
     )
     parser.add_argument(
+        "--match-list",
+        metavar="FILE",
+        help=(
+            "Only delete files/directories whose storage path matches at least "
+            "one regex in FILE. Blank lines and # comments are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List and log matching delete candidates without sending DELETE requests.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=20,
@@ -140,7 +158,10 @@ def parse_args() -> argparse.Namespace:
         default=20,
         metavar="N",
         dest="progress_every",
-        help="Refresh progress counter every N completed operations (default: 20)",
+        help=(
+            "Write a summary to the log every N completed/ignored operations "
+            "(default: 20)"
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -189,8 +210,10 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    # Normalize directory — strip surrounding slashes, re-add trailing slash
-    args.directory = args.directory.strip("/") + "/"
+    # Normalize directory. Root stays empty so /{zone}/ is not doubled.
+    args.directory = args.directory.strip("/")
+    if args.directory:
+        args.directory += "/"
 
     # Validate and parse dates
     args.since_date: datetime.date | None = None
@@ -211,8 +234,101 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             f"--since ({args.since}) must not be later than --before ({args.before})."
         )
+    if args.workers < 1:
+        parser.error("--workers must be >= 1.")
+    if args.progress_every < 1:
+        parser.error("--progress-every must be >= 1.")
 
     return args
+
+
+# ── Safety confirmations ─────────────────────────────────────────────────────
+
+def _confirm_or_abort(title: str, lines: list[str]) -> None:
+    """Print a safety warning and abort unless the user explicitly confirms."""
+    print(f"\nWARNING: {title}", file=sys.stderr)
+    for line in lines:
+        print(f"  {line}", file=sys.stderr)
+    print("Continue anyway? [y/N]: ", end="", file=sys.stderr, flush=True)
+    answer = sys.stdin.readline()
+    if answer == "":
+        answer = ""
+    else:
+        answer = answer.strip()
+    if answer.lower() not in {"y", "yes"}:
+        print("Aborted.", file=sys.stderr)
+        sys.exit(0)
+
+
+def _before_date_guard_lines(
+    before_date: datetime.date,
+    today: datetime.date | None = None,
+) -> list[str]:
+    """
+    Return warning lines when --before can delete files newer than one year.
+    An empty list means the cutoff only targets files at least one year old.
+    """
+    today = today or datetime.date.today()
+    one_year_ago = today - datetime.timedelta(days=MIN_SAFE_AGE_DAYS)
+    if before_date <= one_year_ago:
+        return []
+
+    lines = [
+        f"Today is {today}; the one-year cutoff is {one_year_ago}.",
+        (
+            f"You passed --before {before_date}, so this run can delete files "
+            "that are newer than one year old."
+        ),
+        (
+            f"Use --before {one_year_ago} or an older date if you only intend "
+            "to delete files older than one year."
+        ),
+    ]
+    if before_date > today:
+        lines.append("The --before date is in the future, which is especially broad.")
+    return lines
+
+
+def confirm_before_date_guard(before_date: datetime.date) -> None:
+    lines = _before_date_guard_lines(before_date)
+    if lines:
+        _confirm_or_abort(
+            "--before does not limit deletion to files older than one year.",
+            lines,
+        )
+
+
+def enforce_match_list_for_recent_before(args: argparse.Namespace) -> None:
+    """
+    Require a real match-list file when --before can delete files newer than one year.
+    This prevents broad recent-date cleanup runs without an explicit path target.
+    """
+    if not _before_date_guard_lines(args.before_date):
+        return
+
+    today = datetime.date.today()
+    one_year_ago = today - datetime.timedelta(days=MIN_SAFE_AGE_DAYS)
+    if not args.match_list:
+        print(
+            "\nERROR: --match-list is required when --before is newer than "
+            f"{one_year_ago} (365 days before today, {today}).",
+            file=sys.stderr,
+        )
+        print(
+            "Provide a match-list file to narrow the deletion target, or use "
+            f"--before {one_year_ago} or an older date.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    match_file = Path(args.match_list)
+    if not match_file.is_file():
+        print(
+            "\nERROR: --match-list must point to an existing file when --before "
+            f"is newer than {one_year_ago}. Got: {match_file}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -308,6 +424,177 @@ def _exception_reason(file_key: str, exact: set[str], dirs: set[str]) -> str | N
     return None
 
 
+# ── Match list ────────────────────────────────────────────────────────────────
+
+MatchPatterns = list[re.Pattern[str]]
+RegexIssue = tuple[int, str, list[str]]
+
+
+_BROAD_REGEX_TEXTS = {
+    ".",
+    ".*",
+    ".*?",
+    ".+",
+    "^",
+    "^.*",
+    "^.*$",
+    "^.+$",
+    ".*$",
+    ".+$",
+    "/",
+    "/.*",
+    "/.*$",
+    "^/",
+    "^/.*",
+    "^/.*$",
+    "[\\s\\S]*",
+    "^[\\s\\S]*$",
+    "(?s).*",
+    "(?s)^.*$",
+}
+
+_NESTED_QUANTIFIER_RE = re.compile(
+    r"\((?:\\.|[^()])*(?:[*+]|\{\d+(?:,\d*)?\})(?:\\.|[^()])*\)"
+    r"\s*(?:[*+]|\{\d+(?:,\d*)?\})"
+)
+
+
+def _representative_storage_paths(root_key: str) -> list[str]:
+    """Small path corpus for detecting regexes that match most assets."""
+    root_key = root_key if root_key.startswith("/") else f"/{root_key}"
+    root_prefix = root_key.rstrip("/")
+
+    def under_root(path: str) -> str:
+        if not root_prefix:
+            return path
+        if root_prefix == "/":
+            return path
+        return f"{root_prefix}{path}"
+
+    return [
+        root_key,
+        under_root("/artistly-ai/user-assets/app/2026/05/02/kdp-images/book.png"),
+        under_root("/artistly-ai/user-assets/app/2026/05/02/avatar.png"),
+        under_root("/artistly-ai/images/app/kdp-images/2025-10-31/cover.png"),
+        under_root("/artistly-ai/images/app/editor/background.png"),
+        under_root("/images/app/ai/illustrator/2025-03-14/flat_2d-abc.png"),
+        under_root("/settings/logo.png"),
+        under_root("/temporary/upload.tmp"),
+        under_root("/videos/app/2025-03-14/render.mp4"),
+        under_root("/documents/report.pdf"),
+    ]
+
+
+def _safe_regex_search(regex: re.Pattern[str], value: str) -> bool:
+    """Run a regex search for safety heuristics; treat regex runtime errors as risky."""
+    try:
+        return regex.search(value) is not None
+    except RuntimeError:
+        return True
+
+
+def _dangerous_regex_reasons(
+    pattern_text: str,
+    regex: re.Pattern[str],
+    root_key: str,
+) -> list[str]:
+    reasons: list[str] = []
+    stripped = pattern_text.strip()
+
+    if stripped in _BROAD_REGEX_TEXTS:
+        reasons.append("looks like a catch-all/root wildcard")
+    if _safe_regex_search(regex, ""):
+        reasons.append("matches the empty string, so it can match every path")
+    if _safe_regex_search(regex, root_key):
+        reasons.append(f"matches the target root path {root_key!r}")
+    if _NESTED_QUANTIFIER_RE.search(stripped):
+        reasons.append("contains nested quantifiers that can be slow or too broad")
+
+    samples = _representative_storage_paths(root_key)
+    hits = sum(1 for path in samples if _safe_regex_search(regex, path))
+    if hits >= max(6, int(len(samples) * 0.8)):
+        reasons.append(
+            f"matches {hits}/{len(samples)} representative storage paths"
+        )
+
+    return reasons
+
+
+def load_match_patterns(path: str | None, root_key: str) -> MatchPatterns:
+    """
+    Load newline-separated regexes from a match-list file.
+    Patterns are matched against unencoded storage paths without the
+    /{storage-zone} prefix, e.g. /artistly-ai/images/app/file.png.
+    """
+    if not path:
+        return []
+
+    match_file = Path(path)
+    if not match_file.exists():
+        print(f"ERROR: match list file not found: {match_file}", file=sys.stderr)
+        sys.exit(1)
+
+    patterns: MatchPatterns = []
+    invalid_entries: list[tuple[int, str, str]] = []
+    dangerous_entries: list[RegexIssue] = []
+
+    with match_file.open() as fh:
+        for line_no, line in enumerate(fh, start=1):
+            pattern = line.strip()
+            if not pattern or pattern.startswith("#"):
+                continue
+            try:
+                compiled = re.compile(pattern)
+            except re.error as exc:
+                invalid_entries.append((line_no, pattern, str(exc)))
+                continue
+
+            reasons = _dangerous_regex_reasons(pattern, compiled, root_key)
+            if reasons:
+                dangerous_entries.append((line_no, pattern, reasons))
+            patterns.append(compiled)
+
+    if invalid_entries:
+        lines = [
+            "Invalid regex entries were found in the match list.",
+            "Continuing will ignore these invalid entries:",
+        ]
+        for line_no, pattern, error in invalid_entries[:10]:
+            lines.append(f"{match_file}:{line_no}: {pattern!r} ({error})")
+        if len(invalid_entries) > 10:
+            lines.append(f"... and {len(invalid_entries) - 10} more invalid entry(s).")
+        _confirm_or_abort("Invalid regex entries in --match-list.", lines)
+
+    if not patterns:
+        print(f"ERROR: match list has no usable regex entries: {match_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if dangerous_entries:
+        lines = [
+            "Potentially dangerous regex entries were found in the match list.",
+            "These may target all or most assets under the selected directory:",
+        ]
+        for line_no, pattern, reasons in dangerous_entries[:10]:
+            lines.append(f"{match_file}:{line_no}: {pattern!r}")
+            for reason in reasons:
+                lines.append(f"    - {reason}")
+        if len(dangerous_entries) > 10:
+            lines.append(
+                f"... and {len(dangerous_entries) - 10} more risky entry(s)."
+            )
+        _confirm_or_abort("Potentially broad regex entries in --match-list.", lines)
+
+    print(f"  Loaded {len(patterns)} regex pattern(s) from {match_file}\n", flush=True)
+    return patterns
+
+
+def _matches_patterns(path_key: str, patterns: MatchPatterns) -> bool:
+    """Return True when no match-list is active or any regex matches path_key."""
+    if not patterns:
+        return True
+    return any(pattern.search(path_key) for pattern in patterns)
+
+
 # ── Progress helpers ──────────────────────────────────────────────────────────
 
 def _elapsed(start: datetime.datetime) -> str:
@@ -315,15 +602,26 @@ def _elapsed(start: datetime.datetime) -> str:
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}m{secs % 60:02d}s"
 
 
-def _print_progress(counters: dict[str, int], start: datetime.datetime) -> None:
-    print(
-        f"\rDeleted: {counters['deleted']} | "
+def _summary_msg(counters: dict[str, int], start: datetime.datetime) -> str:
+    elapsed = _elapsed(start)
+    return (
+        f"Planned: {counters.get('planned', 0)} | "
+        f"Deleted: {counters['deleted']} | "
         f"Skipped: {counters['skipped']} | "
+        f"Ignored: {counters.get('ignored', 0)} | "
         f"Errors: {counters['errors']} | "
-        f"Elapsed: {_elapsed(start)}   ",
-        end="",
-        flush=True,
+        f"Elapsed: {elapsed}"
     )
+
+
+def _log_progress_summary(
+    counters: dict[str, int],
+    start: datetime.datetime,
+    logger: logging.Logger,
+    progress_every: int,
+) -> None:
+    if counters["total"] % progress_every == 0:
+        logger.info(f"[SUMMARY]  {_summary_msg(counters, start)}")
 
 
 def _print_summary(
@@ -331,13 +629,7 @@ def _print_summary(
     start: datetime.datetime,
     logger: logging.Logger,
 ) -> None:
-    elapsed = _elapsed(start)
-    msg = (
-        f"Deleted: {counters['deleted']} | "
-        f"Skipped: {counters['skipped']} | "
-        f"Errors: {counters['errors']} | "
-        f"Elapsed: {elapsed}"
-    )
+    msg = _summary_msg(counters, start)
     print(f"\n[DONE]  {msg}")
     logger.info(f"[SUMMARY]  {msg}")
 
@@ -396,16 +688,46 @@ def _dir_key(dir_path: str, zone: str) -> str:
 
 def _extract_path_date(path_key: str) -> datetime.date | None:
     """
-    Return the rightmost YYYY-MM-DD date found in a storage path, or None.
+    Return the deepest date found in a storage path, or None.
+    Supports both YYYY-MM-DD segments and split YYYY/MM/DD directory segments.
     The rightmost date is the most specific (deepest directory level).
     """
-    matches = list(_DATE_RE.finditer(path_key))
-    if not matches:
+    candidates: list[tuple[int, datetime.date]] = []
+
+    for match in _DATE_RE.finditer(path_key):
+        try:
+            candidates.append((match.end(), datetime.date.fromisoformat(match.group())))
+        except ValueError:
+            continue
+
+    offset = 0
+    segments: list[tuple[str, int]] = []
+    for segment in path_key.split("/"):
+        end = offset + len(segment)
+        if segment:
+            segments.append((segment, end))
+        offset = end + 1
+
+    for idx in range(len(segments) - 2):
+        year_s, _year_end = segments[idx]
+        month_s, _month_end = segments[idx + 1]
+        day_s, day_end = segments[idx + 2]
+        if not (
+            len(year_s) == 4 and year_s.isdigit()
+            and len(month_s) == 2 and month_s.isdigit()
+            and len(day_s) == 2 and day_s.isdigit()
+        ):
+            continue
+        try:
+            candidates.append(
+                (day_end, datetime.date(int(year_s), int(month_s), int(day_s)))
+            )
+        except ValueError:
+            continue
+
+    if not candidates:
         return None
-    try:
-        return datetime.date.fromisoformat(matches[-1].group())
-    except ValueError:
-        return None
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _any_exception_under(dir_key: str, exc_exact: set[str], exc_dirs: set[str]) -> bool:
@@ -574,9 +896,17 @@ async def delete_worker(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
+    dry_run: bool,
 ) -> bool:
     """Returns True if the file was deleted successfully."""
     display = item_path + item_name
+    if dry_run:
+        counters["planned"] += 1
+        counters["total"] += 1
+        logger.info(f"[DRY RUN]  Would delete {display}")
+        _log_progress_summary(counters, start, logger, progress_every)
+        return True
+
     ok = False
     try:
         async with sem:
@@ -596,13 +926,7 @@ async def delete_worker(
         logger.error(f"[ERROR]    {display}: {exc}")
 
     counters["total"] += 1
-    if counters["total"] % progress_every == 0:
-        _print_progress(counters, start)
-        d, s, e = counters["deleted"], counters["skipped"], counters["errors"]
-        logger.info(
-            f"[SUMMARY]  Deleted: {d} | Skipped: {s} | "
-            f"Errors: {e} | Elapsed: {_elapsed(start)}"
-        )
+    _log_progress_summary(counters, start, logger, progress_every)
     return ok
 
 
@@ -617,9 +941,17 @@ async def delete_directory_worker(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
+    dry_run: bool,
 ) -> bool:
     """Delete an entire directory with a single API call (Bunny deletes recursively).
     Returns True if the directory was deleted (or was already empty)."""
+    if dry_run:
+        counters["planned"] += 1
+        counters["total"] += 1
+        logger.info(f"[DRY RUN DIR] Would delete {dir_path}")
+        _log_progress_summary(counters, start, logger, progress_every)
+        return True
+
     url = f"{base}{dir_path}"
     ok = False
     try:
@@ -654,13 +986,7 @@ async def delete_directory_worker(
         logger.error(f"[ERROR DIR]   {dir_path}: {exc}")
 
     counters["total"] += 1
-    if counters["total"] % progress_every == 0:
-        _print_progress(counters, start)
-        d, s, e = counters["deleted"], counters["skipped"], counters["errors"]
-        logger.info(
-            f"[SUMMARY]  Deleted: {d} | Skipped: {s} | "
-            f"Errors: {e} | Elapsed: {_elapsed(start)}"
-        )
+    _log_progress_summary(counters, start, logger, progress_every)
     return ok
 
 
@@ -686,6 +1012,7 @@ async def cleanup_empty_dirs(
     logger: logging.Logger,
     start: datetime.datetime,
     progress_every: int,
+    dry_run: bool,
     shutdown_event: asyncio.Event | None = None,
 ) -> None:
     """
@@ -704,7 +1031,7 @@ async def cleanup_empty_dirs(
             if await _is_empty_dir(session, dir_path, base):
                 await delete_directory_worker(
                     session, sem, dir_path, base,
-                    counters, logger, start, progress_every,
+                    counters, logger, start, progress_every, dry_run,
                 )
         except RuntimeError:
             pass  # listing failed — leave the directory alone
@@ -878,25 +1205,58 @@ async def watchdog_task(
 ) -> None:
     """
     Periodically check whether any progress has been made.
-    If counters['total'] has not changed for timeout_secs seconds, log a warning
-    and trigger a clean shutdown via shutdown_event.
+    If operation/directory counters have not changed for timeout_secs seconds,
+    log a warning and trigger a clean shutdown via shutdown_event.
     """
-    last_total = counters["total"]
+    last_progress = counters["total"] + counters.get("dirs", 0)
     while not shutdown_event.is_set():
         await asyncio.sleep(min(timeout_secs, 30))
         if shutdown_event.is_set():
             break
-        current_total = counters["total"]
-        if current_total == last_total:
+        current_progress = counters["total"] + counters.get("dirs", 0)
+        if current_progress == last_progress:
             msg = (
                 f"[WATCHDOG] No progress in {timeout_secs}s "
-                f"(total={current_total}). Triggering clean exit."
+                f"(ops={counters['total']}, dirs={counters.get('dirs', 0)}). "
+                "Triggering clean exit."
             )
             print(f"\n{msg}", flush=True)
             logger.warning(msg)
             shutdown_event.set()
             return
-        last_total = current_total
+        last_progress = current_progress
+
+
+# ── Rich progress ─────────────────────────────────────────────────────────────
+
+async def refresh_progress(
+    progress: Progress,
+    task_id,
+    counters: dict[str, int],
+) -> None:
+    """Periodically push live counters into the Rich progress display."""
+    try:
+        while True:
+            progress.update(
+                task_id,
+                dirs=counters["dirs"],
+                planned=counters["planned"],
+                deleted=counters["deleted"],
+                skipped=counters["skipped"],
+                ignored=counters["ignored"],
+                errors=counters["errors"],
+            )
+            await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        progress.update(
+            task_id,
+            dirs=counters["dirs"],
+            planned=counters["planned"],
+            deleted=counters["deleted"],
+            skipped=counters["skipped"],
+            ignored=counters["ignored"],
+            errors=counters["errors"],
+        )
 
 
 # ── BFS main loop ─────────────────────────────────────────────────────────────
@@ -904,9 +1264,19 @@ async def watchdog_task(
 async def run(args: argparse.Namespace) -> None:
     logger = setup_logging()
     exc_exact, exc_dirs = load_exceptions()
+    root_key = f"/{args.directory}" if args.directory else "/"
+    match_patterns = load_match_patterns(args.match_list, root_key)
     base = get_base_url()
     start = datetime.datetime.now()
-    counters: dict[str, int] = {"deleted": 0, "skipped": 0, "errors": 0, "total": 0}
+    counters: dict[str, int] = {
+        "planned": 0,
+        "deleted": 0,
+        "skipped": 0,
+        "ignored": 0,
+        "errors": 0,
+        "total": 0,
+        "dirs": 0,
+    }
     sem = asyncio.Semaphore(args.workers)
     shutdown_event = asyncio.Event()
     # Directories processed via normal listing (not fast-path bulk delete).
@@ -968,10 +1338,28 @@ async def run(args: argparse.Namespace) -> None:
     else:
         wdog = None
 
-    # BFS queue holds full paths including zone prefix, e.g. /myzone/images/
-    queue: asyncio.Queue[str] = asyncio.Queue()
+    # BFS queue holds (full path including zone prefix, inherited match state).
+    queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
     root_dir = f"/{STORAGE_ZONE}/{args.directory}"
-    await queue.put(root_dir)
+    await queue.put((root_dir, False))
+
+    console = Console()
+    progress = Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[bold blue]{task.description}"),
+        TextColumn("[cyan]dirs[/] {task.fields[dirs]}"),
+        TextColumn(
+            "[magenta]planned[/] {task.fields[planned]}  "
+            "[green]deleted[/] {task.fields[deleted]}  "
+            "[yellow]skipped[/] {task.fields[skipped]}  "
+            "[blue]ignored[/] {task.fields[ignored]}  "
+            "[red]errors[/] {task.fields[errors]}"
+        ),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    )
 
     connector = aiohttp.TCPConnector(limit=args.workers + 10)
     timeout = aiohttp.ClientTimeout(connect=30, sock_read=120)
@@ -980,155 +1368,216 @@ async def run(args: argparse.Namespace) -> None:
         headers={"AccessKey": API_KEY},
         timeout=timeout,
     ) as session:
+        refresher: asyncio.Task | None = None
         try:
-            while not queue.empty() and not shutdown_event.is_set():
-                dir_path = await queue.get()
-
-                # ── Already completed in a previous run? ─────────────────────
-                is_checkpointed = dir_path in completed_dirs
-                # ─────────────────────────────────────────────────────────────
-
-                dk = _dir_key(dir_path, STORAGE_ZONE)
-
-                # ── Path-date fast path ───────────────────────────────────────
-                # If the directory path contains a date segment, we can decide
-                # whether to skip or bulk-delete without listing at all.
-                # Skip fast-path for checkpointed dirs — they were already handled.
-                path_date = _extract_path_date(dk)
-                if path_date is not None and not is_checkpointed:
-                    if not _passes_date_filter(
-                        {"DateCreated": str(path_date)}, args.since_date, args.before_date
-                    ):
-                        # Entire directory is outside the date window — skip it.
-                        if args.since_date and path_date < args.since_date:
-                            dir_skip_reason = f"date filter: dir date {path_date}, too old (--since cutoff is {args.since_date})"
-                        else:
-                            dir_skip_reason = f"date filter: dir date {path_date}, too recent (--before cutoff is {args.before_date})"
-                        logger.info(f"[SKIPPED DIR] {dk} ({dir_skip_reason})")
-                        dir_date_skipped.add(dir_path)
-                        continue
-
-                    if not _any_exception_under(dk, exc_exact, exc_dirs):
-                        # Date passes and no exceptions inside — bulk delete.
-                        await _drain_if_needed()
-                        _spawn_task(
-                            delete_directory_worker(
-                                session, sem, dir_path, base,
-                                counters, logger, start, args.progress_every,
-                            ),
-                            dir_path,
-                        )
-                        continue
-                    # else: date passes but exceptions exist — fall through to listing
-                # ─────────────────────────────────────────────────────────────
-
-                if not is_checkpointed:
-                    visited_dirs.add(dir_path)
-                had_items = False
-                try:
-                    async for item in list_files(session, dir_path, base):
-                        if shutdown_event.is_set():
-                            break
-
-                        had_items = True
-
-                        if item["IsDirectory"]:
-                            if args.recursive:
-                                subdir = item["Path"] + item["ObjectName"] + "/"
-                                dir_children.setdefault(dir_path, set()).add(subdir)
-                                await queue.put(subdir)
-                            continue
-
-                        # Checkpointed directories only need subdirectory
-                        # discovery — file-level work was already done.
-                        if is_checkpointed:
-                            continue
-
-                        file_key = _file_key(item, STORAGE_ZONE)
-
-                        exc_reason = _exception_reason(file_key, exc_exact, exc_dirs)
-                        if exc_reason is not None:
-                            counters["skipped"] += 1
-                            counters["total"] += 1
-                            logger.info(f"[SKIPPED]  {file_key} ({exc_reason})")
-                            if counters["total"] % args.progress_every == 0:
-                                _print_progress(counters, start)
-                            continue
-
-                        date_reason = _date_skip_reason(item, args.since_date, args.before_date)
-                        if date_reason is not None:
-                            counters["skipped"] += 1
-                            counters["total"] += 1
-                            logger.info(f"[SKIPPED]  {file_key} ({date_reason})")
-                            if counters["total"] % args.progress_every == 0:
-                                _print_progress(counters, start)
-                            continue
-
-                        await _drain_if_needed()
-                        _spawn_task(
-                            delete_worker(
-                                session, sem,
-                                item["Path"], item["ObjectName"],
-                                base, counters, logger, start, args.progress_every,
-                            ),
-                            dir_path,
-                        )
-
-                    if not shutdown_event.is_set():
-                        dir_listing_ok.add(dir_path)
-
-                    if not had_items and not shutdown_event.is_set() and not is_checkpointed:
-                        # Directory was already empty — delete it immediately.
-                        await _drain_if_needed()
-                        _spawn_task(
-                            delete_directory_worker(
-                                session, sem, dir_path, base,
-                                counters, logger, start, args.progress_every,
-                            ),
-                            dir_path,
-                        )
-                        visited_dirs.discard(dir_path)  # no need to re-check later
-
-                except RuntimeError as exc:
-                    logger.error(f"[ERROR]    Failed to list {dir_path}: {exc}")
-                    counters["errors"] += 1
-                    counters["total"] += 1
-                    dir_listing_failed.add(dir_path)
-
-            if shutdown_event.is_set():
-                print("\n[INTERRUPTED] Waiting for in-flight deletes to finish...")
-
-            # Wait for remaining pending tasks to complete.
-            if pending_tasks:
-                await asyncio.gather(*list(pending_tasks), return_exceptions=True)
-
-            # Post-run cleanup: delete directories that became empty after file deletion.
-            if not shutdown_event.is_set():
-                await cleanup_empty_dirs(
-                    session, sem, visited_dirs, base,
-                    counters, logger, start, args.progress_every,
-                    shutdown_event,
+            action = "Dry run" if args.dry_run else "Deleting"
+            console.print(f"[bold cyan]{action}[/] from {root_dir} ...")
+            with progress:
+                task_id = progress.add_task(
+                    "Crawling",
+                    total=None,
+                    dirs=0,
+                    planned=0,
+                    deleted=0,
+                    skipped=0,
+                    ignored=0,
+                    errors=0,
+                )
+                refresher = asyncio.create_task(
+                    refresh_progress(progress, task_id, counters)
                 )
 
-            # ── Bottom-up checkpointing ──────────────────────────────────
-            # A directory is "fully complete" only when:
-            #   1. Its listing succeeded (or it was date-skipped / already checkpointed)
-            #   2. All of its own file/bulk-delete tasks succeeded
-            #   3. All of its child directories are fully complete (recursive)
-            if checkpoint_path:
-                _save_checkpoint(
-                    checkpoint_path, completed_dirs,
-                    dir_listing_ok, dir_date_skipped, dir_listing_failed,
-                    dir_task_failed, dirs_with_tasks,
-                    dir_children, logger,
-                )
-            # ─────────────────────────────────────────────────────────────
+                while not queue.empty() and not shutdown_event.is_set():
+                    dir_path, inherited_match = await queue.get()
+                    counters["dirs"] += 1
+
+                    # ── Already completed in a previous run? ─────────────────
+                    is_checkpointed = dir_path in completed_dirs
+                    # ─────────────────────────────────────────────────────────
+
+                    dk = _dir_key(dir_path, STORAGE_ZONE)
+                    dir_matches = _matches_patterns(dk, match_patterns)
+                    dir_selected = inherited_match or dir_matches
+
+                    # ── Path-date fast path ─────────────────────────────────
+                    # If the directory path contains a date segment, we can
+                    # decide whether to skip or bulk-delete without listing.
+                    # Skip fast-path for checkpointed dirs — already handled.
+                    path_date = _extract_path_date(dk)
+                    if path_date is not None and not is_checkpointed:
+                        if not _passes_date_filter(
+                            {"DateCreated": str(path_date)},
+                            args.since_date,
+                            args.before_date,
+                        ):
+                            # Entire directory is outside the date window.
+                            if args.since_date and path_date < args.since_date:
+                                dir_skip_reason = (
+                                    f"date filter: dir date {path_date}, too old "
+                                    f"(--since cutoff is {args.since_date})"
+                                )
+                            else:
+                                dir_skip_reason = (
+                                    f"date filter: dir date {path_date}, too recent "
+                                    f"(--before cutoff is {args.before_date})"
+                                )
+                            logger.info(f"[SKIPPED DIR] {dk} ({dir_skip_reason})")
+                            dir_date_skipped.add(dir_path)
+                            continue
+
+                        if dir_selected and not _any_exception_under(
+                            dk, exc_exact, exc_dirs
+                        ):
+                            # Date passes, path is targeted, and no exceptions
+                            # are inside — bulk delete.
+                            await _drain_if_needed()
+                            _spawn_task(
+                                delete_directory_worker(
+                                    session, sem, dir_path, base,
+                                    counters, logger, start, args.progress_every,
+                                    args.dry_run,
+                                ),
+                                dir_path,
+                            )
+                            continue
+                        # else: list so file-level matching/exceptions can apply.
+                    # ─────────────────────────────────────────────────────────
+
+                    if not is_checkpointed and dir_selected:
+                        visited_dirs.add(dir_path)
+                    had_items = False
+                    try:
+                        async for item in list_files(session, dir_path, base):
+                            if shutdown_event.is_set():
+                                break
+
+                            had_items = True
+
+                            if item["IsDirectory"]:
+                                if args.recursive:
+                                    subdir = item["Path"] + item["ObjectName"] + "/"
+                                    dir_children.setdefault(dir_path, set()).add(subdir)
+                                    await queue.put((subdir, dir_selected))
+                                continue
+
+                            # Checkpointed directories only need subdirectory
+                            # discovery — file-level work was already done.
+                            if is_checkpointed:
+                                continue
+
+                            file_key = _file_key(item, STORAGE_ZONE)
+
+                            if not (
+                                dir_selected or _matches_patterns(file_key, match_patterns)
+                            ):
+                                counters["ignored"] += 1
+                                counters["total"] += 1
+                                _log_progress_summary(
+                                    counters, start, logger, args.progress_every
+                                )
+                                continue
+
+                            exc_reason = _exception_reason(file_key, exc_exact, exc_dirs)
+                            if exc_reason is not None:
+                                counters["skipped"] += 1
+                                counters["total"] += 1
+                                logger.info(f"[SKIPPED]  {file_key} ({exc_reason})")
+                                _log_progress_summary(
+                                    counters, start, logger, args.progress_every
+                                )
+                                continue
+
+                            date_reason = _date_skip_reason(
+                                item, args.since_date, args.before_date
+                            )
+                            if date_reason is not None:
+                                counters["skipped"] += 1
+                                counters["total"] += 1
+                                logger.info(f"[SKIPPED]  {file_key} ({date_reason})")
+                                _log_progress_summary(
+                                    counters, start, logger, args.progress_every
+                                )
+                                continue
+
+                            await _drain_if_needed()
+                            _spawn_task(
+                                delete_worker(
+                                    session, sem,
+                                    item["Path"], item["ObjectName"],
+                                    base, counters, logger, start,
+                                    args.progress_every, args.dry_run,
+                                ),
+                                dir_path,
+                            )
+
+                        if not shutdown_event.is_set():
+                            dir_listing_ok.add(dir_path)
+
+                        if (
+                            not had_items
+                            and not shutdown_event.is_set()
+                            and not is_checkpointed
+                            and dir_selected
+                        ):
+                            # Directory was already empty — delete it immediately.
+                            await _drain_if_needed()
+                            _spawn_task(
+                                delete_directory_worker(
+                                    session, sem, dir_path, base,
+                                    counters, logger, start, args.progress_every,
+                                    args.dry_run,
+                                ),
+                                dir_path,
+                            )
+                            visited_dirs.discard(dir_path)  # no need to re-check later
+
+                    except RuntimeError as exc:
+                        logger.error(f"[ERROR]    Failed to list {dir_path}: {exc}")
+                        counters["errors"] += 1
+                        counters["total"] += 1
+                        dir_listing_failed.add(dir_path)
+
+                if shutdown_event.is_set():
+                    console.print("[yellow]Interrupted — waiting for in-flight deletes...[/]")
+
+                # Wait for remaining pending tasks to complete.
+                if pending_tasks:
+                    await asyncio.gather(*list(pending_tasks), return_exceptions=True)
+
+                # Post-run cleanup: delete directories that became empty after file deletion.
+                if not shutdown_event.is_set():
+                    await cleanup_empty_dirs(
+                        session, sem, visited_dirs, base,
+                        counters, logger, start, args.progress_every,
+                        args.dry_run,
+                        shutdown_event,
+                    )
+
+                # ── Bottom-up checkpointing ──────────────────────────────
+                # A directory is "fully complete" only when:
+                #   1. Its listing succeeded (or it was date-skipped / already checkpointed)
+                #   2. All of its own file/bulk-delete tasks succeeded
+                #   3. All of its child directories are fully complete (recursive)
+                if checkpoint_path and not args.dry_run:
+                    _save_checkpoint(
+                        checkpoint_path, completed_dirs,
+                        dir_listing_ok, dir_date_skipped, dir_listing_failed,
+                        dir_task_failed, dirs_with_tasks,
+                        dir_children, logger,
+                    )
+                # ─────────────────────────────────────────────────────────
 
         finally:
+            if refresher is not None:
+                refresher.cancel()
+                try:
+                    await refresher
+                except asyncio.CancelledError:
+                    pass
             if wdog is not None:
                 wdog.cancel()
             _print_summary(counters, start, logger)
-            if checkpoint_path:
+            if checkpoint_path and not args.dry_run:
                 total_completed = sum(
                     1 for line in Path(checkpoint_path).open()
                     if line.strip()
@@ -1136,6 +1585,11 @@ async def run(args: argparse.Namespace) -> None:
                 print(
                     f"  Checkpoint: {total_completed} completed directories "
                     f"saved to '{checkpoint_path}'.",
+                    flush=True,
+                )
+            elif checkpoint_path and args.dry_run:
+                print(
+                    f"  Dry run: checkpoint '{checkpoint_path}' was not updated.",
                     flush=True,
                 )
 
@@ -1153,5 +1607,7 @@ if __name__ == "__main__":
     if args.region:
         REGION = args.region
 
+    enforce_match_list_for_recent_before(args)
+    confirm_before_date_guard(args.before_date)
     check_env()
     asyncio.run(run(args))

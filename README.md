@@ -16,7 +16,9 @@ Designed to run for days against large storage zones (90 TB+) without leaking me
 - Iterative BFS traversal — no recursion stack; handles arbitrarily deep directory trees
 - Rate-limit aware — exponential back-off with jitter on HTTP 429 and 5xx responses
 - Exception lists — supports multiple `exception.list*` files; protects exact files and entire directories from deletion
+- Match lists — optional newline-separated regex file to restrict deletion to matching asset paths
 - Rotating logs — writes structured logs to a date-stamped folder, rotating at 100 MB
+- Rich progress — live terminal status for directories, deleted, skipped, ignored, and errors
 - Graceful shutdown — Ctrl+C (or SIGTERM) drains in-flight deletes before exiting and always prints a final summary
 
 ---
@@ -29,7 +31,8 @@ flowchart TD
     parseArgs --> checkEnv[Check credentials - exit if missing]
     checkEnv --> setupLog[Setup rotating log file]
     setupLog --> loadEx[Load exception.list* files]
-    loadEx --> initSession[Init aiohttp ClientSession]
+    loadEx --> loadMatch[Load optional match-list regexes]
+    loadMatch --> initSession[Init aiohttp ClientSession]
     initSession --> initQueue["BFS queue ← target directory"]
     initQueue --> bfsLoop[Pop next directory from queue]
 
@@ -39,7 +42,9 @@ flowchart TD
         listOk -->|Yes| iterItems[Yield next item]
         iterItems --> isDir{IsDirectory?}
         isDir -->|"Yes + -r"| appendQueue[Push subdir onto queue]
-        isDir -->|No| checkEx{In exception list?}
+        isDir -->|No| checkMatch{Matches target?}
+        checkMatch -->|No| ignore["Increment ignored counter"]
+        checkMatch -->|Yes| checkEx{In exception list?}
         checkEx -->|Yes| skip["[SKIPPED] exception"]
         checkEx -->|No| checkDate{Passes date filter?}
         checkDate -->|No| skipDate["[SKIPPED] date filter"]
@@ -62,13 +67,14 @@ any depth are handled without hitting Python's recursion limit.
 
 ### Path-date fast path
 
-When a directory path contains a `YYYY-MM-DD` segment (e.g. `.../2025-03-14/`), the
-script uses the date directly without waiting for the API's `DateCreated` field:
+When a directory path contains a `YYYY-MM-DD` segment (e.g. `.../2025-03-14/`)
+or split `YYYY/MM/DD` segments (e.g. `.../2026/05/02/`), the script uses the
+date directly without waiting for the API's `DateCreated` field:
 
 | Condition | Action | API calls saved |
 |---|---|---|
 | Date fails `--before` / `--since` filter | Skip directory entirely | list + all deletes |
-| Date passes filter + no exceptions under dir | Bulk-delete whole directory in one call | list + N−1 deletes |
+| Date passes filter + path is targeted + no exceptions under dir | Bulk-delete whole directory in one call | list + N−1 deletes |
 | Date passes filter + exceptions exist under dir | Fall through to normal per-file listing | none |
 | No date in path | Fall through to normal per-file listing | none |
 
@@ -83,7 +89,7 @@ This is most impactful for large date-partitioned storage zones — a directory 
 ### uv
 
 The script is a self-contained [PEP 723](https://peps.python.org/pep-0723/) inline-dependency script.
-[`uv`](https://docs.astral.sh/uv/) resolves and caches `aiohttp` and `ijson` automatically on first run — no virtualenv or `pip install` needed.
+[`uv`](https://docs.astral.sh/uv/) resolves and caches `aiohttp`, `ijson`, and `rich` automatically on first run — no virtualenv or `pip install` needed.
 
 **Install uv (Linux / macOS):**
 
@@ -185,6 +191,60 @@ correctly — they normalise to the same key before matching.
 
 ---
 
+## Match Lists
+
+Pass `--match-list FILE` to restrict deletion to assets whose storage path matches at
+least one regex in the file. Entries are plain regexes, one per line. Blank lines and
+lines starting with `#` are ignored.
+
+Regexes match the unencoded Bunny storage path without the storage-zone prefix and with
+a leading slash, for example:
+
+```
+/artistly-ai/user-assets/app/2026/05/02/kdp-images/file.png
+/artistly-ai/images/app/kdp-images/2025-10-31/file.png
+```
+
+Directory matches are treated as subtree matches. If a regex matches
+`/artistly-ai/images/app/kdp-images/`, files below that directory are eligible even if
+the file name itself does not match the regex.
+
+Example `match.list` for `kdp-images` directories:
+
+```regex
+# Any directory segment named kdp-images
+(^|/)kdp-images(/|$)
+```
+
+The exception list still wins. If a matched file is in `exception.list*`, it is skipped.
+If a matched dated directory contains any exception entry, the script does not bulk-delete
+that directory and falls back to per-file listing.
+
+---
+
+## Safety Guardrails
+
+The script asks for explicit confirmation before risky runs:
+
+- If `--before` is newer than 365 days before the run date, `--match-list` is
+  required and must point to an existing file.
+- After that requirement is satisfied, the script still warns that the cutoff can
+  delete files newer than one year old and asks for confirmation.
+- If `--match-list` contains invalid regexes, the script warns before continuing
+  without those entries. If no usable regex remains, it aborts.
+- If `--match-list` contains broad patterns such as catch-all wildcards, root-path
+  matches, empty-string matches, or patterns that match most representative asset
+  paths, the script warns before continuing.
+
+Pressing `Enter`, answering anything other than `y`/`yes`, or running non-interactively
+without a response aborts the run before Bunny API traversal begins.
+
+Use `--dry-run` for verification. In dry-run mode the script still lists matching
+paths, but it logs planned deletes and never sends Bunny DELETE requests or updates
+the checkpoint file.
+
+---
+
 ## Usage
 
 ```
@@ -199,8 +259,10 @@ correctly — they normalise to the same key before matching.
 | `-r`, `--recursive` | off | Recurse into all sub-directories |
 | `--since YYYY-MM-DD` | — | Only delete files created **on or after** this date |
 | `--before YYYY-MM-DD` | *(required)* | Only delete files created **before** this date |
+| `--match-list FILE` | — | Only delete paths matching regexes from FILE |
+| `--dry-run` | off | Log matching delete candidates without sending DELETE requests |
 | `--workers N` | `20` | Max concurrent DELETE requests (safe max: ~80) |
-| `--progress-every N` | `20` | Refresh the terminal counter every N completed operations |
+| `--progress-every N` | `20` | Write a periodic summary to the log every N completed/ignored operations |
 
 Both `--since` and `--before` can be combined (AND logic — both conditions must pass).
 
@@ -231,13 +293,26 @@ Delete files in a specific date window:
 Delete everything in a single flat directory (no recursion):
 
 ```bash
-./delete-files.py -d temp-uploads/
+./delete-files.py -d temp-uploads/ --before 2025-03-05
 ```
 
 Increase concurrency for faster throughput (stay under 80 to respect rate limits):
 
 ```bash
 ./delete-files.py -d images/ -r --before 2025-01-01 --workers 50
+```
+
+Delete only matched `kdp-images` assets, allowing dated matched directories to use the
+bulk-delete fast path:
+
+```bash
+./delete-files.py -d / -r --before 2025-01-01 --match-list match.list.kdp-images --dry-run
+```
+
+Run the same matched cleanup for real after reviewing the dry-run log:
+
+```bash
+./delete-files.py -d / -r --before 2025-01-01 --match-list match.list.kdp-images
 ```
 
 Pass credentials inline without setting environment variables:
@@ -276,12 +351,12 @@ requests, print a final summary, and exit cleanly. No orphaned connections or pa
 
 ## Output
 
-### Terminal (live counter)
+### Terminal (live progress)
 
-A single line is updated in place every `--progress-every` operations:
+A Rich progress line is refreshed continuously:
 
 ```
-Deleted: 45231 | Skipped: 312 | Errors: 4 | Elapsed: 2h14m03s
+Crawling  dirs 125  planned 0  deleted 45231  skipped 312  ignored 9801  errors 4  2h14m03s
 ```
 
 ### Log files
@@ -299,10 +374,11 @@ Each log line is timestamped:
 
 ```
 2026-03-05T14:23:01  [DELETED]  /images/app/ai/illustrator/2025-01-10/flat_2d-abc.png
+2026-03-05T14:23:01  [DRY RUN]  Would delete /images/app/ai/illustrator/2025-01-10/flat_2d-abc.png
 2026-03-05T14:23:01  [SKIPPED]  /settings/logo.png (exception)
 2026-03-05T14:23:02  [SKIPPED]  /images/recent/photo.jpg (date filter)
 2026-03-05T14:23:05  [ERROR]    /images/broken/file.png
-2026-03-05T14:25:00  [SUMMARY]  Deleted: 200 | Skipped: 12 | Errors: 1 | Elapsed: 0h02m00s
+2026-03-05T14:25:00  [SUMMARY]  Planned: 0 | Deleted: 200 | Skipped: 12 | Ignored: 0 | Errors: 1 | Elapsed: 0h02m00s
 ```
 
 Follow the log in real time from another tmux pane:
